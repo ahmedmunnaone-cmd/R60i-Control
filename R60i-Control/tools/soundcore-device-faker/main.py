@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+from bumble.keys import JsonKeyStore
+from bumble.transport import open_transport
+import sys
+import tomllib
+import logging
+import asyncio
+import os
+import dataclasses
+from pathlib import Path
+from typing import Callable, Dict
+from bumble import hci
+from bumble.core import UUID
+from bumble.device import DEVICE_DEFAULT_ADDRESS, Device, DeviceConfiguration
+from bumble.rfcomm import Server, make_service_sdp_records, DLC
+from bumble.avdtp import (
+    AVDTP_AUDIO_MEDIA_TYPE,
+    Listener,
+    MediaCodecCapabilities,
+)
+from bumble.a2dp import (
+    make_audio_sink_service_sdp_records,
+    A2DP_SBC_CODEC_TYPE,
+    SbcMediaCodecInformation,
+)
+from watchdog.events import (
+    DirModifiedEvent,
+    FileModifiedEvent,
+    FileSystemEventHandler,
+)
+from watchdog.observers import Observer
+from soundcoredevicefaker.soundcoresession import SoundcoreSession
+
+
+class ConfigChangedHandler(FileSystemEventHandler):
+    def __init__(self, reload_config: Callable[[], None]):
+        self.reload_config = reload_config
+
+    def on_modified(self, event: DirModifiedEvent | FileModifiedEvent) -> None:
+        self.reload_config()
+
+
+async def main() -> None:
+    if len(sys.argv) < 3:
+        print(
+            "Usage: ./main.py <transport-spec> <device-config>\n"
+            "Example: ./main.py usb:0 devices/q30.toml"
+        )
+        return
+
+    soundcore_session: SoundcoreSession | None = None
+
+    config: Dict = {}
+
+    def refresh_responses(config: Dict, soundcore_session: SoundcoreSession):
+        soundcore_session.clear_responses()
+        for entry in config["responses"]:
+            soundcore_session.set_response(
+                bytes(entry["command"]),
+                [bytes(r) for r in entry["response"]]
+                if len(entry["response"]) > 0 and isinstance(entry["response"][0], list)
+                else bytes(entry["response"]),
+            )
+
+    def reload_config():
+        logging.info("reloading device config")
+        nonlocal config
+        with open(sys.argv[2], mode="rb") as file:
+            config = tomllib.load(file)
+        if soundcore_session is not None:
+            refresh_responses(config, soundcore_session)
+
+    reload_config()
+
+    observer = Observer()
+    config_path = Path(sys.argv[2])
+    observer.schedule(ConfigChangedHandler(reload_config), str(config_path.parent))
+    observer.start()
+
+    async with await open_transport(sys.argv[1]) as hci_transport:
+        if mac_address := config.get("mac_address"):
+            mac_address = hci.Address(mac_address)
+        device = Device.from_config_with_hci(
+            DeviceConfiguration(
+                name=config["name"],
+                class_of_device=2360324,
+                keystore="JsonKeyStore",
+                address=mac_address
+                if mac_address is not None
+                else hci.Address(DEVICE_DEFAULT_ADDRESS),
+            ),
+            hci_transport.source,
+            hci_transport.sink,
+        )
+        if mac_address is not None:
+            device.keystore = JsonKeyStore(str(mac_address))
+        device.classic_enabled = True
+
+        audio_listener = Listener.for_device(device)
+        audio_listener.on("connection", on_avdtp_connection)
+
+        rfcomm_server = Server(device)
+
+        def on_session(session: DLC) -> None:
+            nonlocal soundcore_session
+            nonlocal config
+            soundcore_session = SoundcoreSession(
+                session, config.get("has_checksum", True)
+            )
+            refresh_responses(config, soundcore_session)
+
+        channel_number = rfcomm_server.listen(on_session)
+
+        rfcomm_record_handle = 0x00010001
+        a2dp_record_handle = 0x00010002
+        device.sdp_service_records = {
+            rfcomm_record_handle: make_service_sdp_records(
+                rfcomm_record_handle, channel_number, UUID(config["rfcomm_uuid"])
+            ),
+            a2dp_record_handle: make_audio_sink_service_sdp_records(a2dp_record_handle),
+        }
+
+        await device.power_on()
+        if mac_address is not None:
+            print(f"spoofing mac address: {mac_address}")
+            await device.send_command(HCI_Set_BD_ADDR_Command(bd_addr=mac_address))
+            # restart to activate new mac address
+            await device.power_off()
+            await device.power_on()
+        await device.set_discoverable(True)
+        await device.set_connectable(True)
+
+        await hci_transport.source.wait_for_termination()  # type: ignore
+
+
+# Is this raspberry pi specific?
+HCI_SET_BD_ADDR_COMMAND = hci.hci_command_op_code(0x3F, 0x01)
+hci.HCI_Command.register_commands({"HCI_SET_BD_ADDR_COMMAND": HCI_SET_BD_ADDR_COMMAND})
+
+
+@dataclasses.dataclass
+class HCI_Set_BD_ADDR_ReturnParameters(hci.HCI_StatusReturnParameters):
+    pass
+
+
+@hci.HCI_SyncCommand.sync_command(HCI_Set_BD_ADDR_ReturnParameters)
+@dataclasses.dataclass
+class HCI_Set_BD_ADDR_Command(hci.HCI_SyncCommand[HCI_Set_BD_ADDR_ReturnParameters]):
+    bd_addr: hci.Address = dataclasses.field(
+        metadata=hci.metadata(hci.Address.parse_address)
+    )
+
+
+# -----------------------------------------------------------------------------
+def codec_capabilities():
+    # NOTE: this shouldn't be hardcoded, but passed on the command line instead
+    return MediaCodecCapabilities(
+        media_type=AVDTP_AUDIO_MEDIA_TYPE,
+        media_codec_type=A2DP_SBC_CODEC_TYPE,
+        media_codec_information=SbcMediaCodecInformation(
+            sampling_frequency=SbcMediaCodecInformation.SamplingFrequency.SF_48000
+            | SbcMediaCodecInformation.SamplingFrequency.SF_44100
+            | SbcMediaCodecInformation.SamplingFrequency.SF_32000
+            | SbcMediaCodecInformation.SamplingFrequency.SF_16000,
+            channel_mode=SbcMediaCodecInformation.ChannelMode.MONO
+            | SbcMediaCodecInformation.ChannelMode.DUAL_CHANNEL
+            | SbcMediaCodecInformation.ChannelMode.STEREO
+            | SbcMediaCodecInformation.ChannelMode.JOINT_STEREO,
+            block_length=SbcMediaCodecInformation.BlockLength.BL_4
+            | SbcMediaCodecInformation.BlockLength.BL_8
+            | SbcMediaCodecInformation.BlockLength.BL_12
+            | SbcMediaCodecInformation.BlockLength.BL_16,
+            subbands=SbcMediaCodecInformation.Subbands.S_4
+            | SbcMediaCodecInformation.Subbands.S_8,
+            allocation_method=SbcMediaCodecInformation.AllocationMethod.LOUDNESS
+            | SbcMediaCodecInformation.AllocationMethod.SNR,
+            minimum_bitpool_value=2,
+            maximum_bitpool_value=53,
+        ),
+    )
+
+
+# -----------------------------------------------------------------------------
+def on_avdtp_connection(server):
+    # Add a sink endpoint to the server
+    sink = server.add_sink(codec_capabilities())
+    sink.on("rtp_packet", on_rtp_packet)
+
+
+# -----------------------------------------------------------------------------
+
+
+def on_rtp_packet(packet):
+    pass
+
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "DEBUG").upper())
+asyncio.run(main())

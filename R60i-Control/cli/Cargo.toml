@@ -1,0 +1,40 @@
+[package]
+name = "openscq30-cli"
+edition = "2024"
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openscq30"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+bundled-dependencies = ["openscq30-lib/bundled-dependencies"]
+
+[dependencies]
+openscq30-lib = { workspace = true }
+openscq30-i18n = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["wrap_help"] }
+clap_complete = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+macaddr = { workspace = true }
+dirs = { workspace = true }
+strum = { workspace = true }
+tabled = { workspace = true }
+terminal_size = { workspace = true }
+csv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true, features = ["serde"] }
+regex = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+insta-cmd = { workspace = true }
+tempfile = { workspace = true }

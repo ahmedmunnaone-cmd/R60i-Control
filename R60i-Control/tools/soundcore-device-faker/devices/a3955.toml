@@ -1,0 +1,179 @@
+name = "Soundcore P40i"
+mac_address = "00:00:00:00:39:55"
+rfcomm_uuid = "0CF12D31-FAC3-4553-BD80-D6832E7B3955"
+
+[[responses]]
+# State update
+command = [1, 1]
+response = [
+    0,        # Host Device
+    1,        # Is TWS Connected
+    4,        # Left Battery Level
+    2,        # Right Battery Level
+    0,        # Left Battery Charging
+    0,        # Right Battery Charging
+    48,       # 0 Left Firmware Start
+    49,       # 1
+    46,       # .
+    54,       # 6
+    55,       # 7 Left Firmware End
+    48,       # Right Firmware Start
+    49,
+    46,
+    54,
+    55,       # Right Firmware End
+    51,       # Serial Number Start
+    57,
+    53,
+    53,
+    57,
+    56,
+    52,
+    55,
+    52,
+    52,
+    54,
+    54,
+    101,
+    102,
+    101,
+    51,       # Serial Number End
+    48,       # 0 ???
+    46,       # . ???
+    49,       # 1 ???
+    46,       # . ???
+    56,       # 8 ???
+    1,        # Case Battery Level
+    254,      # EQ Profile
+    254,      # EQ Profile
+    180,      # Left eq start
+    152,
+    140,
+    140,
+    120,
+    133,
+    136,
+    142,
+    120,
+    120,      # Left eq end
+    255,      # Right eq start
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,      # right eq end
+    255,      # if 255, hear id is uninitialized? I guess this is what AgeRange means?
+    1,        # hear id enabled?
+    120,      # Left hear id start
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,      # left hear id end
+    120,      # right hear id start
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,
+    120,      # right hear id end
+    0,        # time start
+    0,
+    0,
+    0,        # time end
+    2,        # hear id type
+    255,      # left custom hear id start
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    0,        # left custom hear id end
+    255,      #right custom hear id start
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    0,        # right custom hear id end
+    0,        # music genre
+    0,        # music genre
+    10,       # Unknown but changing it from 10 disables a lot of settings in the app?
+    0x11,     # Left Single Tap, 0xFF is disabled for all of these, 0=volume+, 1=volume-, 2=previous, 3=next, ambient sound=4, voice assistant=5, 6=play/pause
+    0xFF,     # Right Single Tap
+    0x63,     # Left Double Tap
+    0x66,     # Right Tap and Hold
+    0x33,     # Left tap 3 times
+    0x33,     # Right tap 3 times
+    0x44,     # Left tap and hold
+    0x33,     # Right tap and hold
+    0b110011, # Ambient sound cycle, 0b110abc where a=normal, b=transparency, c=noise canceling
+    0,        # Ambient Sound Mode
+    0x51,     # Manual/Adaptive ANC
+    0,        # Transparency Mode
+    2,        # manual anc=0, adaptive anc=1, multi-scene anc=2
+    1,        # Wind noise reduction
+    0,        # ???
+    1,
+    0,
+    0,
+    0,
+    0,
+    255,
+    255,
+    1,        # ANC Personalized to ear canal
+    49,
+    1,        # Touch Tone
+    1,        # dual connections
+    1,        # Limit High Volume
+    82,       # DB level, expects 75, 80, 85, 90, 95, 100
+    2,        # DB reading refresh rate. 0=real time, 1=10 seconds, 2=1 minute
+    1,        # Auto power off enabled
+    3,        # Auto power off duration, 0=10m 1=20m 2=30m 3=60m
+    1,
+    1,        # Low Battery Prompt
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    255,
+    25,
+]
+
+[[responses]]
+# DB level
+command = [32, 3]
+response = [
+    80, # current db level
+]
+
+[[responses]]
+# DB level
+command = [5, 1]
+response = [1]
+
+[[responses]]
+# DB level
+command = [5, 129]
+response = [1]

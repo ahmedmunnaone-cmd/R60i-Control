@@ -1,0 +1,28 @@
+[arg("profile", pattern="dev|release|release-fast")]
+build profile features='':
+    cargo build --profile '{{profile}}' --features '{{features}}'
+
+test:
+    cargo test --bins
+    cargo test --test '*'
+
+test-cov:
+    cargo llvm-cov --no-report --bins
+    cargo llvm-cov --no-report --test '*'
+
+snapshot-test:
+    -cargo test --test '*'
+    cargo insta review
+
+install path:
+    ./scripts/install.sh '{{path}}'
+
+uninstall path:
+    ./scripts/uninstall.sh '{{path}}'
+
+alias fmt := format
+format:
+    cargo fmt
+
+format-check:
+    cargo fmt --check
