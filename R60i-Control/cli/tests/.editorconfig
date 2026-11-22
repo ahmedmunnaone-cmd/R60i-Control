@@ -1,3 +1,0 @@
-# Snapshot tests will fail if we remove the expected trailing whitespace
-[*.rs]
-trim_trailing_whitespace = false
