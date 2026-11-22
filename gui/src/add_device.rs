@@ -1,0 +1,364 @@
+use std::{collections::HashMap, sync::Arc};
+
+use cosmic::{
+    Apply, Element, Task,
+    iced::{Length, alignment, keyboard},
+    widget::{self, menu::KeyBind},
+};
+use itertools::Itertools;
+use openscq30_i18n::Translate;
+use openscq30_lib::{
+    DeviceModel, OpenSCQ30Session, connection::ConnectionDescriptor, storage::PairedDevice,
+};
+use strum::IntoEnumIterator;
+use tracing::error;
+
+use crate::fl;
+
+pub struct AddDeviceModel {
+    stage: Stage,
+    session: Arc<OpenSCQ30Session>,
+    key_binds: HashMap<KeyBind, KeyBindAction>,
+}
+
+enum Stage {
+    ModelSelection(ModelSelectionModel),
+    SelectDevice(SelectDeviceModel),
+    Error(String),
+}
+
+struct ModelSelectionModel {
+    search_query: String,
+    search_widget_id: widget::Id,
+    device_models_localized_lowercase: Vec<String>,
+    device_models_lowercase: Vec<String>,
+}
+struct SelectDeviceModel {
+    search_query: String,
+    search_widget_id: widget::Id,
+    devices: Option<Vec<ConnectionDescriptor>>,
+    device_model: DeviceModel,
+    is_demo_mode: bool,
+}
+
+#[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
+pub enum Message {
+    SetDeviceModelSearchQuery(String),
+    SelectModel(DeviceModel, bool),
+    SelectDevice(usize, bool),
+    SetDeviceList(Vec<ConnectionDescriptor>, bool),
+    SetDeviceNameSearchQuery(String),
+    SetErrorMessage(String),
+}
+
+pub enum Action {
+    None,
+    Task(Task<Message>),
+    AddDevice(PairedDevice),
+    FocusTextInput(cosmic::widget::Id),
+}
+
+impl AddDeviceModel {
+    pub fn new(session: Arc<OpenSCQ30Session>) -> Self {
+        Self {
+            session,
+            stage: Stage::ModelSelection(ModelSelectionModel {
+                search_query: String::new(),
+                search_widget_id: widget::Id::unique(),
+                device_models_localized_lowercase: DeviceModel::iter()
+                    .map(|model| model.translate().to_lowercase())
+                    .collect(),
+                device_models_lowercase: DeviceModel::iter()
+                    .map(|model| <&'static str>::from(model).to_lowercase())
+                    .collect(),
+            }),
+            key_binds: key_binds(),
+        }
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        match &self.stage {
+            Stage::ModelSelection(ui_model) => Self::device_model_selection(ui_model),
+            Stage::SelectDevice(ui_model) => Self::select_device(ui_model),
+            Stage::Error(message) => Self::error(message),
+        }
+    }
+
+    fn device_model_selection(ui_model: &ModelSelectionModel) -> Element<'_, Message> {
+        let search_query_lowercase = ui_model.search_query.to_lowercase();
+
+        widget::column![
+            widget::column![
+                widget::text::title2(fl!("select-device-model")),
+                widget::search_input(fl!("device-model"), &ui_model.search_query)
+                    .id(ui_model.search_widget_id.clone())
+                    .on_input(Message::SetDeviceModelSearchQuery),
+            ]
+            .spacing(8)
+            // padding should not apply to the list of devices, since those are buttons with their own padding
+            .padding([0, 10]),
+            widget::scrollable(widget::column(
+                DeviceModel::iter()
+                    .zip(&ui_model.device_models_lowercase)
+                    .zip(&ui_model.device_models_localized_lowercase)
+                    .map(|tuple| (tuple.0.0, tuple.0.1, tuple.1))
+                    .filter_map(|(device_model, model_name, localized_name)| {
+                        let maybe_index = localized_name.find(&search_query_lowercase);
+                        // Only search by model name if the search query is long enough to prevent including,
+                        // for example, all a30* devices when someone searches "30" to find "Soundcore Q30"
+                        if maybe_index.is_some()
+                            || (search_query_lowercase.len() >= 4
+                                && model_name.contains(&search_query_lowercase))
+                        {
+                            // put model_name matches after localized_name matches. we use a stable sort,
+                            // so giving them all usize::MAX won't affect the ordering
+                            Some((device_model, maybe_index.unwrap_or(usize::MAX)))
+                        } else {
+                            None
+                        }
+                    })
+                    .sorted_by(|(_, left), (_, right)| left.cmp(right))
+                    .map(|(device_model, _)| {
+                        // custom button with ButtonClass::Text because button::text ignores width(Length::Fill)
+                        widget::button::custom(widget::text(device_model.translate()))
+                            .class(widget::button::ButtonClass::Text)
+                            .width(Length::Fill)
+                            .on_press(Message::SelectModel(device_model, false))
+                            .into()
+                    }),
+            ),)
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn select_device(ui_model: &SelectDeviceModel) -> Element<'_, Message> {
+        widget::responsive(|size| {
+            widget::column![
+                widget::column![
+                    widget::text::title2(fl!(
+                        "select-your",
+                        name = ui_model.device_model.translate()
+                    )),
+                    {
+                        let search_input =
+                            widget::search_input(fl!("device-name"), &ui_model.search_query)
+                                .id(ui_model.search_widget_id.clone())
+                                .on_input(Message::SetDeviceNameSearchQuery);
+                        let demo_toggle = widget::toggler(ui_model.is_demo_mode)
+                            .label(fl!("demo-mode"))
+                            .spacing(4)
+                            .on_toggle(|enabled| {
+                                Message::SelectModel(ui_model.device_model, enabled)
+                            });
+                        let refresh = widget::button::standard(fl!("refresh"))
+                            .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
+                            .on_press(Message::SelectModel(
+                                ui_model.device_model,
+                                ui_model.is_demo_mode,
+                            ));
+                        if size.width < 450f32 {
+                            Element::from(
+                                widget::column![
+                                    search_input,
+                                    widget::row![
+                                        demo_toggle.apply(widget::container).width(Length::Fill),
+                                        refresh
+                                            .apply(widget::container)
+                                            .width(Length::Fill)
+                                            .align_x(alignment::Horizontal::Right),
+                                    ]
+                                    .spacing(8)
+                                    .align_y(alignment::Vertical::Center),
+                                ]
+                                .spacing(8),
+                            )
+                        } else {
+                            widget::row![search_input, demo_toggle, refresh]
+                                .align_y(alignment::Vertical::Center)
+                                .spacing(8)
+                                .into()
+                        }
+                    }
+                ]
+                .spacing(8)
+                .padding([0, 10]),
+                if let Some(devices) = &ui_model.devices {
+                    widget::scrollable(widget::column(
+                        devices
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, device)| {
+                                device
+                                    .name
+                                    .to_lowercase()
+                                    .contains(&ui_model.search_query.to_lowercase())
+                            })
+                            .map(|(index, device)| {
+                                widget::button::custom(
+                                    widget::row![
+                                        widget::text(&device.name),
+                                        widget::text(device.mac_address.to_string())
+                                            .align_x(alignment::Horizontal::Right)
+                                            .width(Length::Fill),
+                                    ]
+                                    .align_y(alignment::Vertical::Center),
+                                )
+                                .name(&device.name)
+                                .class(widget::button::ButtonClass::Text)
+                                .width(Length::Fill)
+                                .on_press(Message::SelectDevice(index, ui_model.is_demo_mode))
+                                .into()
+                            }),
+                    ))
+                    .into()
+                } else {
+                    Self::loading()
+                }
+            ]
+            .spacing(8)
+            .into()
+        })
+        .into()
+    }
+
+    fn loading() -> Element<'static, Message> {
+        widget::progress_bar::indeterminate_circular()
+            .apply(widget::container)
+            .center(Length::Fill)
+            .into()
+    }
+
+    fn error(message: &str) -> Element<'_, Message> {
+        widget::column![
+            widget::text::title2(fl!("error-loading-devices")),
+            widget::text::monotext(message),
+        ]
+        .apply(widget::container)
+        .center(Length::Fill)
+        .into()
+    }
+
+    #[must_use]
+    pub fn update(&mut self, message: Message) -> Action {
+        match message {
+            Message::SetDeviceModelSearchQuery(query) => {
+                if let Stage::ModelSelection(ref mut ui_model) = self.stage {
+                    ui_model.search_query = query;
+                }
+            }
+            Message::SelectModel(device_model, is_demo_mode) => {
+                if let Stage::SelectDevice(ref mut ui_model) = self.stage {
+                    // if we're already on the select device page, don't clear the search and such
+                    ui_model.device_model = device_model;
+                    ui_model.is_demo_mode = is_demo_mode;
+                    ui_model.devices = None;
+                } else {
+                    self.stage = Stage::SelectDevice(SelectDeviceModel {
+                        search_query: String::new(),
+                        search_widget_id: widget::Id::unique(),
+                        devices: None,
+                        device_model,
+                        is_demo_mode,
+                    });
+                }
+                let session = self.session.clone();
+                return Action::Task(Task::perform(
+                    async move {
+                        if is_demo_mode {
+                            session.list_demo_devices(device_model).await
+                        } else {
+                            session.list_devices(device_model).await
+                        }
+                    },
+                    move |result| match result {
+                        Ok(devices) => Message::SetDeviceList(devices, is_demo_mode),
+                        Err(err) => {
+                            error!("{} fetching devices: {err:?}", device_model);
+                            Message::SetErrorMessage(format!("{err}"))
+                        }
+                    },
+                ));
+            }
+            Message::SetDeviceList(devices, is_demo_mode) => {
+                if let Stage::SelectDevice(ref mut ui_model) = self.stage {
+                    ui_model.devices = Some(devices);
+                    ui_model.is_demo_mode = is_demo_mode;
+                }
+            }
+            Message::SetDeviceNameSearchQuery(query) => {
+                if let Stage::SelectDevice(ref mut ui_model) = self.stage {
+                    ui_model.search_query = query;
+                }
+            }
+            Message::SetErrorMessage(message) => self.stage = Stage::Error(message),
+            Message::SelectDevice(index, is_demo) => {
+                if let Stage::SelectDevice(ui_model) = &self.stage
+                    && let Some(devices) = &ui_model.devices
+                {
+                    let descriptor = devices[index].clone();
+                    return Action::AddDevice(PairedDevice {
+                        mac_address: descriptor.mac_address,
+                        model: ui_model.device_model,
+                        is_demo,
+                    });
+                }
+            }
+        }
+        Action::None
+    }
+
+    #[must_use]
+    pub fn on_key_pressed(
+        &mut self,
+        modifiers: keyboard::Modifiers,
+        key: &keyboard::Key,
+        physical_key: &keyboard::key::Physical,
+    ) -> Action {
+        let action = self
+            .key_binds
+            .iter()
+            .find(|(bind, _)| bind.matches(modifiers, key, Some(physical_key)))
+            .map(|(_, action)| action)
+            .copied();
+        if let Some(action) = action {
+            self.handle_key_bind_action(action)
+        } else {
+            Action::None
+        }
+    }
+
+    fn handle_key_bind_action(&mut self, action: KeyBindAction) -> Action {
+        match action {
+            KeyBindAction::Find => match &self.stage {
+                Stage::ModelSelection(model_selection) => {
+                    Action::FocusTextInput(model_selection.search_widget_id.clone())
+                }
+                Stage::SelectDevice(select_device) => {
+                    Action::FocusTextInput(select_device.search_widget_id.clone())
+                }
+                _ => Action::None,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum KeyBindAction {
+    Find,
+}
+
+fn key_binds() -> HashMap<KeyBind, KeyBindAction> {
+    let mut key_binds = HashMap::new();
+
+    key_binds.insert(
+        KeyBind {
+            modifiers: vec![cosmic::widget::menu::key_bind::Modifier::Ctrl],
+            key: keyboard::Key::Character("f".into()),
+        },
+        KeyBindAction::Find,
+    );
+
+    key_binds
+}

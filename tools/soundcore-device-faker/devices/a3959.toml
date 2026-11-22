@@ -1,0 +1,100 @@
+name = "Soundcore R50i NC"
+mac_address = "00:00:00:00:39:59"
+rfcomm_uuid = "0CF12D31-FAC3-4553-BD80-D6832E7B395B"
+
+[[responses]]
+# State update
+command = [1, 1]
+response = [
+    1,    # Host device
+    1,    # Is TWS connected
+    0,    # Left battery (0 is 10%, 9 is 100%)
+    9,    # Right battery
+    255,  # Unknown
+    255,  # Unknown
+    48,   # Left Firmware Version Start
+    49,
+    46,
+    54,
+    52,   # Left Firmware Version End
+    48,   # Right Firmware Version Start
+    49,
+    46,
+    54,
+    52,   # Right Firmware Version End
+    51,   # Serial Number Start
+    57,
+    53,
+    57,
+    68,
+    69,
+    68,
+    54,
+    54,
+    57,
+    50,
+    68,
+    66,
+    54,
+    70,
+    52,   # Serial Number End
+    254,  # EQ profile
+    254,  # EQ profile
+    101,  # EQ bands start
+    120,
+    161,
+    171,
+    171,
+    152,
+    144,
+    60,
+    120,
+    120,  # EQ bands end
+    0,    # Start Maybe DRC related?
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,    # End maybe DRC related
+    10,   # Unknown, changing from 10 can enable gaming mode or mess up ambient sound mode
+    241,  # Left Single Tap
+    240,  # Right Single Tap
+    102,  # Left Double Tap
+    102,  # Right Double Tap
+    242,  # Left Tap 3 Times
+    243,  # Right Tap 3 Times
+    68,   # Left Tap and Hold
+    68,   # Right Tap and Hold
+    51,   # Ambient Sound Mode Cycle
+    0,    # Ambient Sound Mode
+    0x55, # Noise Canceling Manual Mode
+    0,    # Ambient Sound Mode (again)
+    0,    # Noise Canceling Mode Type (0=manual 1=adaptive 2=multi-scene)
+    1,    # Wind Noise Reduction
+    255,  # Unknown
+    1,    # Multi-Scene ANC (0=transport 1=outdoor 2=indoor)
+    49,   # Unknown
+    1,    # Touch Tone
+    1,    # Dual Connections
+    0,    # Unknown
+    1,    # Auto power off enabled
+    0,    # Auto power off duration
+    1,    # Low battery prompt
+    0,    # Gaming mode
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+    0,    # Unknown
+]

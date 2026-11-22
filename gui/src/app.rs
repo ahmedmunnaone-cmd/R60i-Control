@@ -1,0 +1,739 @@
+use std::{
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
+    iter,
+    ops::Deref,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+};
+
+use cosmic::{
+    Application, ApplicationExt, Apply, Task,
+    app::{Core, context_drawer::ContextDrawer},
+    iced::{Length, alignment, event, keyboard},
+    widget::{self, menu::KeyBind, nav_bar},
+};
+use i18n_embed::unic_langid::LanguageIdentifier;
+use macaddr::MacAddr6;
+use openscq30_i18n::Translate;
+use openscq30_lib::{OpenSCQ30Session, device::OpenSCQ30Device, storage::PairedDevice};
+use strum::VariantArray;
+use tokio::{select, sync::Semaphore};
+
+use crate::{
+    add_device::{self, AddDeviceModel},
+    config::{AppTheme, Config},
+    device_selection::{self, DeviceSelectionModel},
+    device_settings, fl,
+    utils::coalesce_result,
+};
+
+pub struct AppModel {
+    core: Core,
+    screen: Screen,
+    dialog_page: Option<DialogPage>,
+    session: Arc<OpenSCQ30Session>,
+    warnings: VecDeque<String>,
+    config: Config,
+    config_dir: PathBuf,
+    about: widget::about::About,
+    context_drawer_screen: Option<ContextDrawerScreen>,
+    available_language_names: Vec<Cow<'static, str>>,
+    available_languages: Vec<Option<LanguageIdentifier>>,
+    theme_names: Vec<String>,
+    key_binds: HashMap<KeyBind, KeyBindAction>,
+}
+
+#[derive(Clone, Copy)]
+enum KeyBindAction {
+    Settings,
+    CloseDialog,
+}
+
+pub struct AppFlags {
+    pub config: Config,
+    pub config_dir: PathBuf,
+}
+
+enum ContextDrawerScreen {
+    About,
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    DeviceSelectionScreen(device_selection::Message),
+    AddDeviceScreen(add_device::Message),
+    DeviceSettingsScreen(device_settings::Message),
+    CloseDialog,
+    RemovePairedDevice(MacAddr6),
+    BackToDeviceSelection,
+    ActivateConnectToDeviceScreen(DebugOpenSCQ30Device),
+    CloseDialogAndRefreshPairedDevices,
+    ActivateDeviceSelectionScreen,
+    Warning(String),
+    CloseWarning,
+    ToggleAbout,
+    OpenUrl(String),
+    CloseContextDrawer,
+    ConnectToDeviceFailed(String),
+    CancelConnectToDevice,
+    ToggleSettings,
+    None,
+    SetPreferredLanguage(usize),
+    SetTheme(usize),
+    KeyPressed {
+        modifiers: keyboard::Modifiers,
+        key: keyboard::Key,
+        physical_key: keyboard::key::Physical,
+    },
+}
+
+impl From<device_selection::Message> for Message {
+    fn from(message: device_selection::Message) -> Self {
+        Self::DeviceSelectionScreen(message)
+    }
+}
+impl From<add_device::Message> for Message {
+    fn from(message: add_device::Message) -> Self {
+        Self::AddDeviceScreen(message)
+    }
+}
+impl From<device_settings::Message> for Message {
+    fn from(message: device_settings::Message) -> Self {
+        Self::DeviceSettingsScreen(message)
+    }
+}
+#[derive(Clone)]
+pub struct DebugOpenSCQ30Device(pub Arc<dyn OpenSCQ30Device + Send + Sync>);
+impl std::fmt::Debug for DebugOpenSCQ30Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenSCQ30Device").finish()
+    }
+}
+impl Deref for DebugOpenSCQ30Device {
+    type Target = Arc<dyn OpenSCQ30Device + Send + Sync>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+enum DialogPage {
+    RemoveDevice(PairedDevice),
+}
+
+#[allow(clippy::large_enum_variant)]
+enum Screen {
+    DeviceSelection(device_selection::DeviceSelectionModel),
+    AddDevice(add_device::AddDeviceModel),
+    Connecting {
+        canceled: Arc<Semaphore>,
+        name: String,
+    },
+    DeviceSettings(device_settings::DeviceSettingsModel),
+}
+
+// This is a macro so that the file/line number of the tracing message matches the caller
+#[macro_export]
+macro_rules! handle_soft_error {
+    () => {
+        |err| {
+            let err = ::anyhow::Error::from(err);
+            ::tracing::warn!("soft_error: {err:?}");
+            Message::Warning($crate::fl!("error-with-message", err = format!("{err:#}")))
+        }
+    };
+}
+
+impl Application for AppModel {
+    type Executor = cosmic::executor::Default;
+    type Flags = AppFlags;
+    type Message = Message;
+
+    const APP_ID: &'static str = "com.oppzippy.OpenSCQ30";
+
+    fn core(&self) -> &Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut Core {
+        &mut self.core
+    }
+
+    fn init(core: Core, flags: Self::Flags) -> (Self, cosmic::app::Task<Self::Message>) {
+        let about = widget::about::About::default()
+            .name(fl!("openscq30"))
+            .icon(crate::icons::openscq30())
+            .version(env!("CARGO_PKG_VERSION"))
+            .author(env!("CARGO_PKG_AUTHORS"))
+            .license(env!("CARGO_PKG_LICENSE"))
+            .links([(env!("CARGO_PKG_REPOSITORY"), env!("CARGO_PKG_REPOSITORY"))]);
+
+        let session = Arc::new(
+            futures::executor::block_on(OpenSCQ30Session::new(
+                flags.config_dir.join("database.sqlite"),
+            ))
+            .expect("database is required to run"),
+        );
+        let (model, task) = DeviceSelectionModel::new(session.clone());
+        let (available_languages, available_language_names) =
+            iter::once((None, Cow::Owned(fl!("default"))))
+                .chain(
+                    crate::i18n::languages()
+                        .map(|(identifier, name)| (Some(identifier), Cow::Owned(name))),
+                )
+                .collect::<(Vec<_>, Vec<_>)>();
+        let mut app = Self {
+            core,
+            screen: Screen::DeviceSelection(model),
+            dialog_page: None,
+            session,
+            warnings: VecDeque::with_capacity(5),
+            config: flags.config,
+            config_dir: flags.config_dir,
+            about,
+            context_drawer_screen: None,
+            available_language_names,
+            available_languages,
+            theme_names: AppTheme::VARIANTS
+                .iter()
+                .map(|theme| theme.translate())
+                .collect(),
+            key_binds: key_binds(),
+        };
+        let command = app.update_title();
+        (
+            app,
+            cosmic::Task::batch([
+                command,
+                task.map(Message::DeviceSelectionScreen).map(Into::into),
+            ]),
+        )
+    }
+
+    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
+        event::listen_with(|event, status, _window_id| match event {
+            event::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                modifiers,
+                key,
+                physical_key,
+                ..
+            }) if matches!(status, cosmic::iced::event::Status::Ignored) => {
+                Some(Message::KeyPressed {
+                    modifiers,
+                    key,
+                    physical_key,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    fn nav_model(&self) -> Option<&nav_bar::Model> {
+        match &self.screen {
+            Screen::DeviceSettings(model) => model.nav_model(),
+            _ => None,
+        }
+    }
+
+    fn on_nav_select(&mut self, id: nav_bar::Id) -> cosmic::app::Task<Self::Message> {
+        match &mut self.screen {
+            Screen::DeviceSettings(model) => model
+                .on_nav_select(id)
+                .map(Message::DeviceSettingsScreen)
+                .map(Into::into),
+            _ => unreachable!("no nav bar is shown, so selecting an item is impossible"),
+        }
+    }
+
+    fn header_start(&self) -> Vec<cosmic::Element<'_, Self::Message>> {
+        match self.screen {
+            Screen::DeviceSelection(_) => Vec::new(),
+            _ => vec![
+                widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
+                    .on_press(Message::BackToDeviceSelection)
+                    .into(),
+            ],
+        }
+    }
+
+    fn header_end(&self) -> Vec<cosmic::Element<'_, Self::Message>> {
+        vec![
+            widget::button::icon(widget::icon::from_name("preferences-system-symbolic"))
+                .on_press(Message::ToggleSettings)
+                .into(),
+            widget::button::icon(widget::icon::from_name("help-about-symbolic"))
+                .on_press(Message::ToggleAbout)
+                .into(),
+        ]
+    }
+
+    fn view(&self) -> cosmic::Element<'_, Self::Message> {
+        widget::Column::with_capacity(2)
+            .push_maybe(
+                self.warnings.front().map(|message| {
+                    crate::warning::warning(message).on_close(Message::CloseWarning)
+                }),
+            )
+            .push(match &self.screen {
+                Screen::DeviceSelection(device_selection_model) => cosmic::Element::from(
+                    device_selection_model
+                        .view()
+                        .map(Message::DeviceSelectionScreen),
+                ),
+                Screen::AddDevice(add_device_model) => {
+                    add_device_model.view().map(Message::AddDeviceScreen)
+                }
+                Screen::Connecting { canceled: _, name } => self.view_cancel(name),
+                Screen::DeviceSettings(device_settings_model) => device_settings_model
+                    .view()
+                    .map(Message::DeviceSettingsScreen),
+            })
+            .into()
+    }
+
+    fn dialog(&self) -> Option<cosmic::Element<'_, Self::Message>> {
+        let dialog = match &self.screen {
+            Screen::DeviceSelection(_device_selection_model) => None,
+            Screen::AddDevice(_add_device_model) => None,
+            Screen::Connecting { .. } => None,
+            Screen::DeviceSettings(device_settings_model) => device_settings_model
+                .dialog()
+                .map(|e| e.map(Message::DeviceSettingsScreen)),
+        };
+        if dialog.is_some() {
+            return dialog;
+        }
+        let dialog_page = self.dialog_page.as_ref()?;
+        Some(match dialog_page {
+            DialogPage::RemoveDevice(device) => widget::dialog()
+                .title(fl!("prompt-remove-device-title"))
+                .body(fl!("prompt-remove-device", name = device.model.translate()))
+                .icon(widget::icon::from_name("dialog-warning-symbolic"))
+                .primary_action(
+                    widget::button::destructive(fl!("remove"))
+                        .on_press(Message::RemovePairedDevice(device.mac_address)),
+                )
+                .secondary_action(
+                    widget::button::text(fl!("cancel")).on_press(Message::CloseDialog),
+                )
+                .into(),
+        })
+    }
+
+    fn context_drawer(&self) -> Option<ContextDrawer<'_, Self::Message>> {
+        if let Some(context_drawer_screen) = &self.context_drawer_screen {
+            match context_drawer_screen {
+                ContextDrawerScreen::About => Some(cosmic::app::context_drawer::about(
+                    &self.about,
+                    |url| Message::OpenUrl(url.to_owned()),
+                    Message::CloseContextDrawer,
+                )),
+                ContextDrawerScreen::Settings => Some(
+                    cosmic::app::context_drawer::context_drawer(
+                        widget::column![
+                            widget::settings::item::builder(fl!("preferred-language"))
+                                .flex_control(widget::dropdown(
+                                    &self.available_language_names,
+                                    Some(
+                                        self.config
+                                            .get()
+                                            .preferred_language
+                                            .as_ref()
+                                            .and_then(|preferred_language| {
+                                                LanguageIdentifier::from_str(preferred_language)
+                                                    .ok()
+                                            })
+                                            .and_then(|preferred_language| {
+                                                self.available_languages
+                                                    .iter()
+                                                    .skip(1)
+                                                    .position(|l| {
+                                                        l.as_ref() == Some(&preferred_language)
+                                                    })
+                                                    .map(|index| index + 1)
+                                            })
+                                            .unwrap_or_default(),
+                                    ),
+                                    Message::SetPreferredLanguage,
+                                )),
+                            widget::settings::item::builder(fl!("theme")).flex_control(
+                                widget::dropdown(
+                                    &self.theme_names,
+                                    AppTheme::VARIANTS
+                                        .iter()
+                                        .position(|theme| *theme == self.config.get().theme),
+                                    Message::SetTheme,
+                                )
+                            ),
+                        ],
+                        Message::CloseContextDrawer,
+                    )
+                    .title(fl!("settings")),
+                ),
+            }
+        } else {
+            match &self.screen {
+                Screen::DeviceSelection(_device_selection_model) => None,
+                Screen::AddDevice(_add_device_model) => None,
+                Screen::Connecting { .. } => None,
+                Screen::DeviceSettings(device_settings_model) => device_settings_model
+                    .context_drawer()
+                    .map(|drawer| drawer.map(Message::DeviceSettingsScreen)),
+            }
+        }
+    }
+
+    fn update(&mut self, message: Self::Message) -> cosmic::app::Task<Self::Message> {
+        match message {
+            Message::None => (),
+            Message::KeyPressed {
+                modifiers,
+                key,
+                physical_key,
+            } => {
+                // workaround for mutable borrow of both self and self.screen in match
+                enum ActionKind {
+                    Global(KeyBindAction),
+                    AddDevice(add_device::Action),
+                    DeviceSettings(device_settings::Action),
+                }
+                let action = match &mut self.screen {
+                    Screen::AddDevice(add_device) => Some(ActionKind::AddDevice(
+                        add_device.on_key_pressed(modifiers, &key, &physical_key),
+                    )),
+                    Screen::DeviceSettings(device_settings) => Some(ActionKind::DeviceSettings(
+                        device_settings.on_key_pressed(modifiers, &key, &physical_key),
+                    )),
+                    _ => None,
+                }
+                .or_else(|| {
+                    self.key_binds
+                        .iter()
+                        .find(|(key_bind, _)| {
+                            key_bind.matches(modifiers, &key, Some(&physical_key))
+                        })
+                        .map(|(_, action)| ActionKind::Global(*action))
+                });
+                match action {
+                    Some(ActionKind::Global(action)) => match action {
+                        KeyBindAction::Settings => self.toggle_settings(),
+                        KeyBindAction::CloseDialog => {
+                            self.dialog_page = None;
+                        }
+                    },
+                    Some(ActionKind::AddDevice(action)) => {
+                        return self.handle_add_device_action(action);
+                    }
+                    Some(ActionKind::DeviceSettings(action)) => {
+                        return self.handle_device_settings_action(action);
+                    }
+                    None => (),
+                }
+            }
+            Message::DeviceSelectionScreen(message) => {
+                if let Screen::DeviceSelection(ref mut screen) = self.screen {
+                    match screen.update(message) {
+                        device_selection::Action::ConnectToDevice(paired_device) => {
+                            let session = self.session.clone();
+                            let canceled = Arc::new(Semaphore::new(0));
+                            self.screen = Screen::Connecting {
+                                canceled: canceled.clone(),
+                                name: paired_device.model.translate(),
+                            };
+                            return Task::future(async move {
+                                let connect_result = select! {
+                                    connect_result = session.connect(paired_device.mac_address) => connect_result,
+                                    _ = canceled.acquire() => return Ok(Message::None.into()),
+                                };
+
+                                match connect_result {
+                                    Ok(device) => {
+                                        Ok(Message::ActivateConnectToDeviceScreen(DebugOpenSCQ30Device(
+                                            device,
+                                        ))
+                                        .into())
+                                    },
+                                    Err(err) => {
+                                        let err = anyhow::Error::from(err);
+                                        tracing::warn!("soft_error: {err:?}");
+                                        Ok(Message::ConnectToDeviceFailed(fl!(
+                                                "error-with-message",
+                                                err = format!("{err:#}")
+                                        )).into())
+                                    },
+                                }
+                            })
+                            .map(coalesce_result);
+                        }
+                        device_selection::Action::RemoveDevice(device) => {
+                            self.dialog_page = Some(DialogPage::RemoveDevice(device));
+                        }
+                        device_selection::Action::AddDevice => {
+                            self.screen =
+                                Screen::AddDevice(AddDeviceModel::new(self.session.clone()));
+                        }
+                        device_selection::Action::None => (),
+                        device_selection::Action::Warning(message) => {
+                            return Task::done(Message::Warning(message).into());
+                        }
+                    }
+                }
+            }
+            Message::AddDeviceScreen(message) => {
+                if let Screen::AddDevice(ref mut screen) = self.screen {
+                    match screen.update(message) {
+                        add_device::Action::None => (),
+                        add_device::Action::Task(task) => {
+                            return task.map(Message::AddDeviceScreen).map(Into::into);
+                        }
+                        add_device::Action::AddDevice(paired_device) => {
+                            let database = self.session.clone();
+                            return Task::future(async move {
+                                database
+                                    .pair(paired_device)
+                                    .await
+                                    .map_err(handle_soft_error!())?;
+                                Ok(Message::ActivateDeviceSelectionScreen.into())
+                            })
+                            .map(coalesce_result);
+                        }
+                        add_device::Action::FocusTextInput(id) => {
+                            return widget::text_input::focus(id);
+                        }
+                    }
+                }
+            }
+            Message::ActivateDeviceSelectionScreen => {
+                let (model, task) = DeviceSelectionModel::new(self.session.clone());
+                self.screen = Screen::DeviceSelection(model);
+                return task.map(Message::DeviceSelectionScreen).map(Into::into);
+            }
+            Message::DeviceSettingsScreen(message) => {
+                let maybe_action = if let Screen::DeviceSettings(ref mut screen) = self.screen {
+                    Some(screen.update(message))
+                } else {
+                    None
+                };
+                if let Some(action) = maybe_action {
+                    return self.handle_device_settings_action(action);
+                }
+            }
+            Message::CloseDialog => self.dialog_page = None,
+            Message::RemovePairedDevice(mac_address) => {
+                let database = self.session.clone();
+                return Task::future(async move {
+                    database
+                        .unpair(mac_address)
+                        .await
+                        .map_err(handle_soft_error!())?;
+                    Ok(Message::CloseDialogAndRefreshPairedDevices.into())
+                })
+                .map(coalesce_result);
+            }
+            Message::CloseDialogAndRefreshPairedDevices => {
+                if let Screen::DeviceSelection(ref mut _screen) = self.screen {
+                    self.dialog_page = None;
+                    return device_selection::DeviceSelectionModel::refresh_paired_devices(
+                        self.session.clone(),
+                    )
+                    .map(Message::from)
+                    .map(Into::into);
+                }
+            }
+            Message::BackToDeviceSelection => {
+                let (model, task) = DeviceSelectionModel::new(self.session.clone());
+                self.screen = Screen::DeviceSelection(model);
+                return task.map(Message::DeviceSelectionScreen).map(Into::into);
+            }
+            Message::CancelConnectToDevice => {
+                if let Screen::Connecting { canceled, .. } = &self.screen {
+                    canceled.close();
+                    return Task::done(Message::ActivateDeviceSelectionScreen.into());
+                }
+            }
+            Message::ConnectToDeviceFailed(message) => {
+                return Task::batch([
+                    Task::done(Message::ActivateDeviceSelectionScreen.into()),
+                    Task::done(Message::Warning(message).into()),
+                ]);
+            }
+            Message::ActivateConnectToDeviceScreen(device) => {
+                let (model, task) = device_settings::DeviceSettingsModel::new(
+                    device,
+                    self.session.quick_preset_handler(),
+                    self.config_dir.to_owned(),
+                );
+                self.screen = Screen::DeviceSettings(model);
+                return task.map(Message::DeviceSettingsScreen).map(Into::into);
+            }
+            Message::Warning(message) => {
+                // cap max number of warnings, since it's bad UX to have to close a million of them if something goes wrong and spams them
+                if self.warnings.capacity() == self.warnings.len() {
+                    self.warnings.pop_front();
+                }
+                self.warnings.push_back(message);
+            }
+            Message::CloseWarning => {
+                self.warnings.pop_front();
+            }
+            Message::CloseContextDrawer => self.context_drawer_screen = None,
+            Message::ToggleAbout => {
+                if matches!(self.context_drawer_screen, Some(ContextDrawerScreen::About)) {
+                    self.context_drawer_screen = None;
+                } else {
+                    self.context_drawer_screen = Some(ContextDrawerScreen::About);
+                }
+            }
+            Message::OpenUrl(url) => {
+                if let Err(err) = open::that_detached(&url) {
+                    tracing::error!("error opening url {url}: {err:?}");
+                }
+            }
+            Message::ToggleSettings => self.toggle_settings(),
+            Message::SetPreferredLanguage(language_index) => {
+                let result_receiver = self.config.modify(|inner| {
+                    inner.preferred_language = self.available_languages[language_index]
+                        .as_ref()
+                        .map(ToString::to_string);
+                });
+
+                return Task::future(async move {
+                    if let Err(err) = result_receiver.await.unwrap() {
+                        tracing::error!("error writing to config file: {err:?}");
+                        Message::Warning(err.to_string())
+                    } else {
+                        Message::None
+                    }
+                })
+                .map(Into::into);
+            }
+            Message::SetTheme(theme_index) => {
+                let result_receiver = self.config.modify(|inner| {
+                    inner.theme = AppTheme::VARIANTS[theme_index];
+                });
+
+                return Task::batch([
+                    self.apply_theme(),
+                    Task::future(async move {
+                        if let Err(err) = result_receiver.await.unwrap() {
+                            tracing::error!("error writing to config file: {err:?}");
+                            Message::Warning(err.to_string())
+                        } else {
+                            Message::None
+                        }
+                    })
+                    .map(Into::into),
+                ]);
+            }
+        }
+        Task::none()
+    }
+}
+
+impl AppModel {
+    fn apply_theme(&self) -> cosmic::app::Task<Message> {
+        cosmic::command::set_theme(match self.config.get().theme {
+            AppTheme::System => self.core.system_theme().clone(),
+            AppTheme::Light => cosmic::Theme::light(),
+            AppTheme::Dark => cosmic::Theme::dark(),
+        })
+    }
+
+    pub fn update_title(&mut self) -> cosmic::app::Task<Message> {
+        if let Some(id) = self.core.main_window_id() {
+            self.set_header_title(fl!("openscq30"));
+            self.set_window_title(fl!("openscq30"), id)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn view_cancel(&self, device_name: &str) -> cosmic::Element<'_, Message> {
+        widget::column![
+            widget::progress_bar::indeterminate_circular(),
+            widget::text::title2(fl!("connecting-to", name = device_name)),
+            widget::button::destructive(fl!("cancel")).on_press(Message::CancelConnectToDevice),
+        ]
+        .spacing(10)
+        .align_x(alignment::Horizontal::Center)
+        .apply(widget::container)
+        .center(Length::Fill)
+        .into()
+    }
+
+    fn handle_add_device_action(
+        &mut self,
+        action: add_device::Action,
+    ) -> cosmic::app::Task<Message> {
+        match action {
+            add_device::Action::None => cosmic::app::Task::none(),
+            add_device::Action::Task(task) => task.map(Message::AddDeviceScreen).map(Into::into),
+            add_device::Action::AddDevice(paired_device) => {
+                let database = self.session.clone();
+                Task::future(async move {
+                    database
+                        .pair(paired_device)
+                        .await
+                        .map_err(handle_soft_error!())?;
+                    Ok(Message::ActivateDeviceSelectionScreen.into())
+                })
+                .map(coalesce_result)
+            }
+            add_device::Action::FocusTextInput(id) => widget::text_input::focus(id),
+        }
+    }
+
+    fn handle_device_settings_action(
+        &mut self,
+        action: device_settings::Action,
+    ) -> cosmic::app::Task<Message> {
+        match action {
+            device_settings::Action::None => Task::none(),
+            device_settings::Action::Task(task) => {
+                task.map(Message::DeviceSettingsScreen).map(Into::into)
+            }
+            device_settings::Action::Warning(message) => {
+                Task::done(Message::Warning(message).into())
+            }
+            device_settings::Action::FocusTextInput(id) => widget::text_input::focus(id),
+            device_settings::Action::Disconnect => {
+                Task::done(Message::ActivateDeviceSelectionScreen.into())
+            }
+        }
+    }
+
+    fn toggle_settings(&mut self) {
+        if matches!(
+            self.context_drawer_screen,
+            Some(ContextDrawerScreen::Settings)
+        ) {
+            self.context_drawer_screen = None;
+        } else {
+            self.context_drawer_screen = Some(ContextDrawerScreen::Settings);
+        }
+    }
+}
+
+fn key_binds() -> HashMap<KeyBind, KeyBindAction> {
+    let mut key_binds = HashMap::new();
+
+    key_binds.insert(
+        KeyBind {
+            modifiers: vec![widget::menu::key_bind::Modifier::Ctrl],
+            key: keyboard::Key::Character(",".into()),
+        },
+        KeyBindAction::Settings,
+    );
+    key_binds.insert(
+        KeyBind {
+            modifiers: Vec::new(),
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+        },
+        KeyBindAction::CloseDialog,
+    );
+
+    key_binds
+}
